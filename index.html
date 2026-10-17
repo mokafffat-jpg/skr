@@ -52,10 +52,18 @@ input[type=file]{width:100%;color:var(--mute);font:inherit;font-size:14px}
   <div class="bar"><i id="str"></i></div>
   <label>تکرار رمز عبور</label>
   <input type="password" id="p2" autocomplete="new-password">
+  <label>اندازه‌ی هر قطعه (برای فایل‌های بزرگ)</label>
+  <select id="csz" style="width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);background:#120f0d;color:var(--ink);font:inherit;font-size:16px">
+    <option value="16">۱۶ مگابایت (کم‌حافظه‌ترین)</option>
+    <option value="32">۳۲ مگابایت</option>
+    <option value="64" selected>۶۴ مگابایت (پیشنهادی)</option>
+    <option value="100">۱۰۰ مگابایت</option>
+  </select>
   <label>نام فایل خروجی</label>
   <input type="text" id="outName" value="archive" dir="ltr">
   <button class="btn" id="goE">فشرده و رمزگذاری کن</button>
   <div class="msg" id="mE"></div>
+  <div class="bar"><i id="progE"></i></div>
   <div class="note">رمز را فراموش کنی هیچ راهی برای بازیابی نیست. رمز طولانی (حداقل ۱۲ حرف، ترکیب حرف و عدد) انتخاب کن.</div>
 </div>
 
@@ -66,14 +74,15 @@ input[type=file]{width:100%;color:var(--mute);font:inherit;font-size:14px}
   <input type="password" id="pd" autocomplete="off">
   <button class="btn" id="goD">باز کن</button>
   <div class="msg" id="mD"></div>
+  <div class="bar"><i id="progD"></i></div>
   <div id="list"></div>
 </div>
 
 <script>
 const $=id=>document.getElementById(id);
 const enc=new TextEncoder(), dec=new TextDecoder();
-const MAGIC=[0x53,0x4B,0x52,0x7F,0x31];   // SKR + 0x7F + نسخه ۱
-const ITER=600000, HLEN=5+4+16+12;
+const MAGIC1=[0x53,0x4B,0x52,0x7F,0x31], MAGIC2=[0x53,0x4B,0x52,0x7F,0x32];
+const ITER=600000, HLEN=37, MB=1048576;
 
 $('tabE').onclick=()=>tab(true); $('tabD').onclick=()=>tab(false);
 function tab(e){
@@ -81,7 +90,11 @@ function tab(e){
   $('tabE').classList.toggle('on',e); $('tabD').classList.toggle('on',!e);
 }
 function say(el,t,c){el.textContent=t; el.className='msg '+(c||'');}
-function fmt(n){return n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(1)+' MB';}
+function prog(id,p){const b=$(id); b.style.width=Math.max(0,Math.min(100,p))+'%'; b.style.background='var(--acc)';}
+function fmt(n){return n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':n<1073741824?(n/1048576).toFixed(1)+' MB':(n/1073741824).toFixed(2)+' GB';}
+let wl=null;
+async function keepAwake(){try{wl=await navigator.wakeLock.request('screen');}catch{}}
+function relAwake(){try{wl&&wl.release();}catch{} wl=null;}
 
 $('p1').oninput=()=>{
   const p=$('p1').value; let s=0;
@@ -93,86 +106,186 @@ async function deriveKey(pw,salt,iter){
   const base=await crypto.subtle.importKey('raw',enc.encode(pw),'PBKDF2',false,['deriveKey']);
   return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:iter,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
 }
-async function pipe(blobOrBuf,stream){
+function save(blob,name){
+  name=name.replace(/[\\/:*?"<>|]/g,'_');
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),600000);
+}
+// نانس هر قطعه = پیشوند تصادفی ۸ بایتی + شماره‌ی قطعه
+function nonce(prefix,idx){const n=new Uint8Array(12); n.set(prefix,0); new DataView(n.buffer).setUint32(8,idx); return n;}
+// داده‌ی احراز هویت هر قطعه: هدر + شماره + پرچم قطعه‌ی آخر + تگ قطعه‌ی قبلی (زنجیره)
+function aad(head,idx,last,prev){
+  const a=new Uint8Array(HLEN+4+1+16); a.set(head,0);
+  new DataView(a.buffer).setUint32(HLEN,idx); a[HLEN+4]=last?1:0; a.set(prev,HLEN+5); return a;
+}
+async function pipeAll(blobOrBuf,stream){
   const b=blobOrBuf instanceof Blob?blobOrBuf:new Blob([blobOrBuf]);
   return new Response(b.stream().pipeThrough(stream)).arrayBuffer();
 }
-function save(blob,name){
-  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name;
-  document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),60000);
-}
 
+/* ───────── قفل کردن (نسخه ۲: قطعه‌قطعه و زنجیره‌ای) ───────── */
 $('goE').onclick=async()=>{
   const m=$('mE'), files=[...$('fE').files], pw=$('p1').value;
   if(!files.length) return say(m,'اول فایل انتخاب کن.','bad');
   if(pw.length<8) return say(m,'رمز باید حداقل ۸ حرف باشد.','bad');
   if(pw!==$('p2').value) return say(m,'رمز و تکرارش یکی نیست.','bad');
-  $('goE').disabled=true;
+  const csz=parseInt($('csz').value)*MB;
+  $('goE').disabled=true; prog('progE',0); await keepAwake();
   try{
     say(m,'در حال آماده‌سازی…');
-    // ۱) ساخت بسته: تعداد فایل‌ها + (نام، حجم، محتوا) برای هر فایل
     const parts=[]; const cnt=new DataView(new ArrayBuffer(4)); cnt.setUint32(0,files.length); parts.push(cnt.buffer);
-    let total=0;
+    let total=0, cbytes=4;
     for(const f of files){
       const nb=enc.encode(f.name), h=new ArrayBuffer(2+nb.length+8), dv=new DataView(h);
       dv.setUint16(0,nb.length); new Uint8Array(h,2,nb.length).set(nb); dv.setFloat64(2+nb.length,f.size);
-      parts.push(h,f); total+=f.size;
+      parts.push(h,f); total+=f.size; cbytes+=h.byteLength+f.size;
     }
-    // ۲) فشرده‌سازی
-    say(m,'در حال فشرده‌سازی…');
-    const packed=await pipe(new Blob(parts),new CompressionStream('deflate-raw'));
-    // ۳) رمزگذاری AES-256-GCM
-    say(m,'در حال رمزگذاری (چند ثانیه صبر کن)…');
-    const salt=crypto.getRandomValues(new Uint8Array(16)), iv=crypto.getRandomValues(new Uint8Array(12));
-    const head=new Uint8Array(HLEN); head.set(MAGIC,0); new DataView(head.buffer).setUint32(5,ITER); head.set(salt,9); head.set(iv,25);
+    const salt=crypto.getRandomValues(new Uint8Array(16)), prefix=crypto.getRandomValues(new Uint8Array(8));
+    const head=new Uint8Array(HLEN); const hv=new DataView(head.buffer);
+    head.set(MAGIC2,0); hv.setUint32(5,ITER); head.set(salt,9); head.set(prefix,25); hv.setUint32(33,csz);
+    say(m,'در حال ساخت کلید (چند ثانیه)…');
     const key=await deriveKey(pw,salt,ITER);
-    const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:head},key,packed);
-    let name=($('outName').value.trim()||'archive').replace(/\.skr$/i,'').replace(/[\\/:*?"<>|]/g,'_');
-    save(new Blob([head,ct],{type:'application/octet-stream'}),name+'.skr');
-    say(m,`انجام شد ✓  حجم اولیه ${fmt(total)} ← حجم نهایی ${fmt(HLEN+ct.byteLength)}`,'ok');
+
+    let done=0;
+    const counter=new TransformStream({transform(c,ctl){done+=c.length;ctl.enqueue(c);}});
+    const reader=new Blob(parts).stream().pipeThrough(counter).pipeThrough(new CompressionStream('deflate-raw')).getReader();
+    const out=[head]; let idx=0, prev=new Uint8Array(16), outBytes=HLEN;
+    async function seal(data,last){
+      const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv:nonce(prefix,idx),additionalData:aad(head,idx,last,prev)},key,data));
+      prev=ct.slice(ct.length-16);
+      out.push(new Blob([ct])); outBytes+=ct.length; idx++;
+      prog('progE',done/cbytes*100);
+      say(m,`قطعه‌ی ${idx} رمز شد · ${Math.round(done/cbytes*100)}٪`);
+    }
+    let acc=null, fill=0, full=null;
+    while(true){
+      const {value,done:fin}=await reader.read();
+      if(fin) break;
+      let off=0;
+      while(off<value.length){
+        if(!acc){acc=new Uint8Array(csz); fill=0;}
+        const n=Math.min(csz-fill,value.length-off);
+        acc.set(value.subarray(off,off+n),fill); fill+=n; off+=n;
+        if(fill===csz){ if(full) await seal(full,false); full=acc; acc=null; fill=0; }
+      }
+    }
+    if(acc&&fill>0){ if(full) await seal(full,false); await seal(acc.subarray(0,fill),true); }
+    else await seal(full,true);
+    full=null; acc=null;
+    let name=($('outName').value.trim()||'archive').replace(/\.skr$/i,'');
+    prog('progE',100);
+    save(new Blob(out,{type:'application/octet-stream'}),name+'.skr');
+    say(m,`انجام شد ✓  ${fmt(total)} ← ${fmt(outBytes)} در ${idx} قطعه‌ی زنجیره‌ای`,'ok');
   }catch(e){ say(m,'خطا: '+(e.message||e),'bad'); }
-  $('goE').disabled=false;
+  relAwake(); $('goE').disabled=false;
 };
 
+/* ───────── باز کردن ───────── */
 $('goD').onclick=async()=>{
-  const m=$('mD'), f=$('fD').files[0], pw=$('pd').value; $('list').innerHTML='';
+  const m=$('mD'), f=$('fD').files[0], pw=$('pd').value; $('list').innerHTML=''; prog('progD',0);
   if(!f) return say(m,'اول فایل .skr را انتخاب کن.','bad');
   if(!pw) return say(m,'رمز را وارد کن.','bad');
-  $('goD').disabled=true;
+  $('goD').disabled=true; await keepAwake();
   try{
-    const buf=new Uint8Array(await f.arrayBuffer());
-    if(buf.length<HLEN+16||MAGIC.some((v,i)=>buf[i]!==v)) throw new Error('این فایل، فایل SKR معتبر نیست.');
-    const head=buf.slice(0,HLEN), dv=new DataView(head.buffer);
-    const iter=dv.getUint32(5), salt=head.slice(9,25), iv=head.slice(25,37);
-    say(m,'در حال بازگشایی…');
-    const key=await deriveKey(pw,salt,iter);
-    let plain;
-    try{ plain=await crypto.subtle.decrypt({name:'AES-GCM',iv,additionalData:head},key,buf.slice(HLEN)); }
-    catch{ throw new Error('رمز اشتباه است یا فایل خراب شده.'); }
-    const raw=new Uint8Array(await pipe(plain,new DecompressionStream('deflate-raw')));
-    const r=new DataView(raw.buffer); let off=0; const n=r.getUint32(off); off+=4;
-    const list=$('list');
-    for(let i=0;i<n;i++){
-      const nl=r.getUint16(off); off+=2;
-      const name=dec.decode(raw.subarray(off,off+nl)); off+=nl;
-      const size=r.getFloat64(off); off+=8;
-      const data=raw.slice(off,off+size); off+=size;
-      const row=document.createElement('div'); row.className='row';
-      const s=document.createElement('span'); s.textContent=name;
-      const z=document.createElement('small'); z.textContent=fmt(size);
-      const b=document.createElement('button'); b.textContent='ذخیره';
-      b.onclick=()=>save(new Blob([data]),name);
-      row.append(s,z,b); list.appendChild(row);
-    }
-    say(m,`رمز درست بود ✓  ${n} فایل پیدا شد. روی «ذخیره» کنار هر فایل بزن.`,'ok');
+    const h=new Uint8Array(await f.slice(0,HLEN).arrayBuffer());
+    if(f.size<HLEN+16||MAGIC1.slice(0,4).some((v,i)=>h[i]!==v)) throw new Error('این فایل، فایل SKR معتبر نیست.');
+    say(m,'در حال ساخت کلید…');
+    if(h[4]===0x31) await openV1(f,pw,m); else if(h[4]===0x32) await openV2(f,pw,m,h); else throw new Error('نسخه‌ی این فایل پشتیبانی نمی‌شود.');
   }catch(e){ say(m,e.message||String(e),'bad'); }
-  $('goD').disabled=false;
+  relAwake(); $('goD').disabled=false;
 };
+
+function addRow(name,size,blob){
+  const row=document.createElement('div'); row.className='row';
+  const s=document.createElement('span'); s.textContent=name;
+  const z=document.createElement('small'); z.textContent=fmt(size);
+  const b=document.createElement('button'); b.textContent='ذخیره'; b.onclick=()=>save(blob,name);
+  row.append(s,z,b); $('list').appendChild(row);
+}
+
+// فایل‌های قدیمی (نسخه ۱)
+async function openV1(f,pw,m){
+  const buf=new Uint8Array(await f.arrayBuffer());
+  const head=buf.slice(0,HLEN), dv=new DataView(head.buffer);
+  const key=await deriveKey(pw,head.slice(9,25),dv.getUint32(5));
+  let plain;
+  try{ plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:head.slice(25,37),additionalData:head},key,buf.slice(HLEN)); }
+  catch{ throw new Error('رمز اشتباه است یا فایل خراب شده.'); }
+  const raw=new Uint8Array(await pipeAll(plain,new DecompressionStream('deflate-raw')));
+  const r=new DataView(raw.buffer); let off=0; const n=r.getUint32(off); off+=4;
+  for(let i=0;i<n;i++){
+    const nl=r.getUint16(off); off+=2;
+    const name=dec.decode(raw.subarray(off,off+nl)); off+=nl;
+    const size=r.getFloat64(off); off+=8;
+    addRow(name,size,new Blob([raw.slice(off,off+size)])); off+=size;
+  }
+  say(m,`رمز درست بود ✓  ${n} فایل پیدا شد. روی «ذخیره» کنار هر فایل بزن.`,'ok');
+}
+
+// فایل‌های جدید (نسخه ۲): قطعه‌ای و زنجیره‌ای
+async function openV2(f,pw,m,head){
+  const dv=new DataView(head.buffer);
+  const iter=dv.getUint32(5), salt=head.slice(9,25), prefix=head.slice(25,33), csz=dv.getUint32(33);
+  if(csz<1024||csz>512*MB) throw new Error('هدر فایل خراب است.');
+  const key=await deriveKey(pw,salt,iter);
+  const ds=new DecompressionStream('deflate-raw'), w=ds.writable.getWriter();
+
+  const feeder=(async()=>{
+    try{
+      let pos=HLEN, idx=0, prev=new Uint8Array(16);
+      while(pos<f.size){
+        const len=Math.min(csz+16,f.size-pos); if(len<16) throw new Error('فایل ناقص یا خراب است.');
+        const last=pos+len>=f.size;
+        const ct=new Uint8Array(await f.slice(pos,pos+len).arrayBuffer());
+        let pt;
+        try{ pt=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:nonce(prefix,idx),additionalData:aad(head,idx,last,prev)},key,ct)); }
+        catch{ throw new Error(idx===0?'رمز اشتباه است یا فایل خراب شده.':`قطعه‌ی ${idx+1} خراب یا دستکاری شده است.`); }
+        prev=ct.slice(ct.length-16);
+        await w.write(pt); pos+=len; idx++;
+        prog('progD',pos/f.size*100); say(m,`قطعه‌ی ${idx} باز شد · ${Math.round(pos/f.size*100)}٪`);
+      }
+      await w.close();
+    }catch(e){ try{await w.abort(e);}catch{} throw e; }
+  })();
+
+  const rd=ds.readable.getReader(); let cur=new Uint8Array(0), co=0;
+  async function more(){ const {value,done}=await rd.read(); if(done) throw new Error('فایل ناقص است.'); cur=value; co=0; }
+  async function need(n){
+    const o=new Uint8Array(n); let g=0;
+    while(g<n){ if(co>=cur.length) await more(); const k=Math.min(n-g,cur.length-co); o.set(cur.subarray(co,co+k),g); g+=k; co+=k; }
+    return o;
+  }
+  async function blobOf(n){
+    const bl=[]; let pend=[], pl=0, left=n;
+    while(left>0){
+      if(co>=cur.length) await more();
+      const k=Math.min(left,cur.length-co); pend.push(cur.subarray(co,co+k)); pl+=k; co+=k; left-=k;
+      if(pl>=16*MB){ bl.push(new Blob(pend)); pend=[]; pl=0; }
+    }
+    if(pend.length) bl.push(new Blob(pend));
+    return new Blob(bl);
+  }
+  let count=0;
+  const consumer=(async()=>{
+    const n=new DataView((await need(4)).buffer).getUint32(0);
+    for(let i=0;i<n;i++){
+      const nl=new DataView((await need(2)).buffer).getUint16(0);
+      const name=dec.decode(await need(nl));
+      const size=new DataView((await need(8)).buffer).getFloat64(0);
+      addRow(name,size,await blobOf(size)); count++;
+    }
+    while(true){ const r=await rd.read(); if(r.done) break; }
+  })();
+  await Promise.all([feeder,consumer]);
+  prog('progD',100);
+  say(m,`رمز درست بود و همه‌ی قطعه‌ها سالم‌اند ✓  ${count} فایل پیدا شد. روی «ذخیره» کنار هر فایل بزن.`,'ok');
+}
 
 if(!window.crypto||!crypto.subtle||typeof CompressionStream==='undefined'){
   say($('mE'),'این مرورگر پشتیبانی نمی‌کند. با Chrome به‌روز باز کن.','bad');
 }
 if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch(()=>{});}
 </script>
+
 </body>
 </html>
