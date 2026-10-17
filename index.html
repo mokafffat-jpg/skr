@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>صندوق SKR</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#14110f">
+<link rel="icon" href="icon-192.png">
+<style>
+:root{--bg:#14110f;--card:#1f1b18;--ink:#f3ece4;--mute:#a79c90;--acc:#e8a33d;--acc2:#2b2118;--bad:#e5645a;--ok:#6cc08b;--line:#3a332d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:Tahoma,"Noto Naskh Arabic",system-ui,sans-serif;line-height:1.7;padding:16px;max-width:560px;margin-inline:auto}
+h1{font-size:22px;margin:8px 0 2px}
+.sub{color:var(--mute);font-size:13px;margin:0 0 16px}
+.tabs{display:flex;gap:8px;margin-bottom:12px}
+.tabs button{flex:1;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--mute);font:inherit;font-size:15px}
+.tabs button.on{background:var(--acc);color:#1b1208;border-color:var(--acc);font-weight:bold}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:12px}
+label{display:block;font-size:14px;color:var(--mute);margin:10px 0 4px}
+input[type=password],input[type=text]{width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);background:#120f0d;color:var(--ink);font:inherit;font-size:16px}
+input[type=file]{width:100%;color:var(--mute);font:inherit;font-size:14px}
+.btn{width:100%;margin-top:14px;padding:14px;border:0;border-radius:12px;background:var(--acc);color:#1b1208;font:inherit;font-size:16px;font-weight:bold}
+.btn:disabled{opacity:.5}
+.btn.sec{background:var(--acc2);color:var(--acc);border:1px solid var(--acc);margin-top:8px;padding:10px;font-size:14px}
+.msg{margin-top:12px;font-size:14px;min-height:20px}
+.bad{color:var(--bad)}.ok{color:var(--ok)}
+.bar{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:6px}
+.bar i{display:block;height:100%;width:0;background:var(--bad);transition:.2s}
+.row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--line);font-size:14px}
+.row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:ltr;text-align:left;flex:1}
+.row small{color:var(--mute)}
+.row button{padding:6px 12px;border-radius:8px;border:1px solid var(--acc);background:none;color:var(--acc);font:inherit;font-size:13px}
+.hide{display:none}
+.note{font-size:12px;color:var(--mute);margin-top:10px}
+</style>
+</head>
+<body>
+<h1>🔐 صندوق SKR</h1>
+<p class="sub">فشرده‌سازی و رمزگذاری فایل‌ها · همه‌چیز فقط روی گوشی خودت انجام می‌شود</p>
+
+<div class="tabs">
+  <button id="tabE" class="on">قفل کردن</button>
+  <button id="tabD">باز کردن</button>
+</div>
+
+<div id="pE" class="card">
+  <label>فایل‌ها را انتخاب کن (چندتا هم می‌شود)</label>
+  <input type="file" id="fE" multiple>
+  <label>رمز عبور</label>
+  <input type="password" id="p1" autocomplete="new-password">
+  <div class="bar"><i id="str"></i></div>
+  <label>تکرار رمز عبور</label>
+  <input type="password" id="p2" autocomplete="new-password">
+  <label>نام فایل خروجی</label>
+  <input type="text" id="outName" value="archive" dir="ltr">
+  <button class="btn" id="goE">فشرده و رمزگذاری کن</button>
+  <div class="msg" id="mE"></div>
+  <div class="note">رمز را فراموش کنی هیچ راهی برای بازیابی نیست. رمز طولانی (حداقل ۱۲ حرف، ترکیب حرف و عدد) انتخاب کن.</div>
+</div>
+
+<div id="pD" class="card hide">
+  <label>فایل با پسوند .skr را انتخاب کن</label>
+  <input type="file" id="fD">
+  <label>رمز عبور</label>
+  <input type="password" id="pd" autocomplete="off">
+  <button class="btn" id="goD">باز کن</button>
+  <div class="msg" id="mD"></div>
+  <div id="list"></div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const enc=new TextEncoder(), dec=new TextDecoder();
+const MAGIC=[0x53,0x4B,0x52,0x7F,0x31];   // SKR + 0x7F + نسخه ۱
+const ITER=600000, HLEN=5+4+16+12;
+
+$('tabE').onclick=()=>tab(true); $('tabD').onclick=()=>tab(false);
+function tab(e){
+  $('pE').classList.toggle('hide',!e); $('pD').classList.toggle('hide',e);
+  $('tabE').classList.toggle('on',e); $('tabD').classList.toggle('on',!e);
+}
+function say(el,t,c){el.textContent=t; el.className='msg '+(c||'');}
+function fmt(n){return n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(1)+' MB';}
+
+$('p1').oninput=()=>{
+  const p=$('p1').value; let s=0;
+  if(p.length>=8)s++; if(p.length>=12)s++; if(/[A-Z]/.test(p)&&/[a-z]/.test(p))s++; if(/\d/.test(p))s++; if(/[^A-Za-z0-9]/.test(p))s++;
+  const b=$('str'); b.style.width=(s*20)+'%'; b.style.background=s<3?'var(--bad)':s<5?'var(--acc)':'var(--ok)';
+};
+
+async function deriveKey(pw,salt,iter){
+  const base=await crypto.subtle.importKey('raw',enc.encode(pw),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:iter,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function pipe(blobOrBuf,stream){
+  const b=blobOrBuf instanceof Blob?blobOrBuf:new Blob([blobOrBuf]);
+  return new Response(b.stream().pipeThrough(stream)).arrayBuffer();
+}
+function save(blob,name){
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),60000);
+}
+
+$('goE').onclick=async()=>{
+  const m=$('mE'), files=[...$('fE').files], pw=$('p1').value;
+  if(!files.length) return say(m,'اول فایل انتخاب کن.','bad');
+  if(pw.length<8) return say(m,'رمز باید حداقل ۸ حرف باشد.','bad');
+  if(pw!==$('p2').value) return say(m,'رمز و تکرارش یکی نیست.','bad');
+  $('goE').disabled=true;
+  try{
+    say(m,'در حال آماده‌سازی…');
+    // ۱) ساخت بسته: تعداد فایل‌ها + (نام، حجم، محتوا) برای هر فایل
+    const parts=[]; const cnt=new DataView(new ArrayBuffer(4)); cnt.setUint32(0,files.length); parts.push(cnt.buffer);
+    let total=0;
+    for(const f of files){
+      const nb=enc.encode(f.name), h=new ArrayBuffer(2+nb.length+8), dv=new DataView(h);
+      dv.setUint16(0,nb.length); new Uint8Array(h,2,nb.length).set(nb); dv.setFloat64(2+nb.length,f.size);
+      parts.push(h,f); total+=f.size;
+    }
+    // ۲) فشرده‌سازی
+    say(m,'در حال فشرده‌سازی…');
+    const packed=await pipe(new Blob(parts),new CompressionStream('deflate-raw'));
+    // ۳) رمزگذاری AES-256-GCM
+    say(m,'در حال رمزگذاری (چند ثانیه صبر کن)…');
+    const salt=crypto.getRandomValues(new Uint8Array(16)), iv=crypto.getRandomValues(new Uint8Array(12));
+    const head=new Uint8Array(HLEN); head.set(MAGIC,0); new DataView(head.buffer).setUint32(5,ITER); head.set(salt,9); head.set(iv,25);
+    const key=await deriveKey(pw,salt,ITER);
+    const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:head},key,packed);
+    let name=($('outName').value.trim()||'archive').replace(/\.skr$/i,'').replace(/[\\/:*?"<>|]/g,'_');
+    save(new Blob([head,ct],{type:'application/octet-stream'}),name+'.skr');
+    say(m,`انجام شد ✓  حجم اولیه ${fmt(total)} ← حجم نهایی ${fmt(HLEN+ct.byteLength)}`,'ok');
+  }catch(e){ say(m,'خطا: '+(e.message||e),'bad'); }
+  $('goE').disabled=false;
+};
+
+$('goD').onclick=async()=>{
+  const m=$('mD'), f=$('fD').files[0], pw=$('pd').value; $('list').innerHTML='';
+  if(!f) return say(m,'اول فایل .skr را انتخاب کن.','bad');
+  if(!pw) return say(m,'رمز را وارد کن.','bad');
+  $('goD').disabled=true;
+  try{
+    const buf=new Uint8Array(await f.arrayBuffer());
+    if(buf.length<HLEN+16||MAGIC.some((v,i)=>buf[i]!==v)) throw new Error('این فایل، فایل SKR معتبر نیست.');
+    const head=buf.slice(0,HLEN), dv=new DataView(head.buffer);
+    const iter=dv.getUint32(5), salt=head.slice(9,25), iv=head.slice(25,37);
+    say(m,'در حال بازگشایی…');
+    const key=await deriveKey(pw,salt,iter);
+    let plain;
+    try{ plain=await crypto.subtle.decrypt({name:'AES-GCM',iv,additionalData:head},key,buf.slice(HLEN)); }
+    catch{ throw new Error('رمز اشتباه است یا فایل خراب شده.'); }
+    const raw=new Uint8Array(await pipe(plain,new DecompressionStream('deflate-raw')));
+    const r=new DataView(raw.buffer); let off=0; const n=r.getUint32(off); off+=4;
+    const list=$('list');
+    for(let i=0;i<n;i++){
+      const nl=r.getUint16(off); off+=2;
+      const name=dec.decode(raw.subarray(off,off+nl)); off+=nl;
+      const size=r.getFloat64(off); off+=8;
+      const data=raw.slice(off,off+size); off+=size;
+      const row=document.createElement('div'); row.className='row';
+      const s=document.createElement('span'); s.textContent=name;
+      const z=document.createElement('small'); z.textContent=fmt(size);
+      const b=document.createElement('button'); b.textContent='ذخیره';
+      b.onclick=()=>save(new Blob([data]),name);
+      row.append(s,z,b); list.appendChild(row);
+    }
+    say(m,`رمز درست بود ✓  ${n} فایل پیدا شد. روی «ذخیره» کنار هر فایل بزن.`,'ok');
+  }catch(e){ say(m,e.message||String(e),'bad'); }
+  $('goD').disabled=false;
+};
+
+if(!window.crypto||!crypto.subtle||typeof CompressionStream==='undefined'){
+  say($('mE'),'این مرورگر پشتیبانی نمی‌کند. با Chrome به‌روز باز کن.','bad');
+}
+if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch(()=>{});}
+</script>
+</body>
+</html>
